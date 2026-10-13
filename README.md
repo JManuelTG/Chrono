@@ -48,29 +48,48 @@ Data Recovery/
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Installation & Quick Start
 
-### Prerequisites
+### Option A: Using Make (macOS / Linux / Windows with Make)
 
-- Windows 10 or 11
-- Python 3.10+
-- Dependencies:
-
-```powershell
-pip install Pillow
+```bash
+make install     # Install dependencies
+make run-gui     # Launch Desktop GUI
+make test        # Run unit tests
 ```
 
-### Launch the GUI
+---
+
+### Option B: Windows 1-Click (No setup needed)
+
+- **Install**: Double-click [`install.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/install.bat)
+- **Launch**: Double-click [`run_gui.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/run_gui.bat)
+
+---
+
+### Option C: Python Package Installation (CLI commands)
+
+Install ChronoRecovery as an editable package:
 
 ```powershell
+pip install -e .
+```
+
+You can now run ChronoRecovery from any directory in your terminal:
+
+```powershell
+chrono-gui          # Launches the desktop GUI
+chrono-cli --help   # Launches the CLI session utility
+```
+
+---
+
+### Option D: Standard Pip
+
+```powershell
+pip install -r requirements.txt
 python recovery_gui.py
 ```
-
-1. Select your target drive from the dropdown (e.g. `G: [USB]`).
-2. Click **⚡ Scan Drive**.
-3. Use the **Quick Filter** buttons (`🖼️ Photos`, `📄 Docs`, `🎬 Videos`, `📦 Archives`) to browse discovered files.
-4. Select files and click **📥 Recover Selected** or click **⭐ Recover All Intact (In View)**.
-5. Save your session to a `.rsf` file anytime using **💾 Save Session (.rsf)**.
 
 ---
 

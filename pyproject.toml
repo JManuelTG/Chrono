@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chronorecovery"
+version = "1.0.0"
+description = "Advanced Deep Filesystem & File Recovery Suite"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Jose Manuel TG" }
+]
+keywords = ["data-recovery", "exfat", "filesystem", "forensics", "gui", "file-recovery"]
+dependencies = [
+    "Pillow>=10.0.0"
+]
+
+[project.scripts]
+chrono-gui = "recovery_gui:main"
+chrono-cli = "chrono_cli:main"
+
+[tool.setuptools]
+packages = ["recovery_session"]
+py-modules = ["recovery_gui", "chrono_cli", "exfat_recovery", "drive_utils", "recover_usb_mp4"]
