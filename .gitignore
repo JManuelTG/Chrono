@@ -1,0 +1,9 @@
+# Git ignore for Data Recovery project
+__pycache__/
+*.pyc
+brain/
+recovered_*/
+test_recovered/
+*.rsf
+*.log
+rea/
