@@ -28,8 +28,12 @@ from recovery_session import (
     RecoverySession,
     RSFHeader,
     PartitionInfo,
+    ScanConfig,
     FileNode
 )
+
+MAX_DISPLAY_ROWS = 5000      # Cap DOM rows in Treeview to prevent UI freeze on massive volumes
+SEARCH_DEBOUNCE_MS = 150     # Debounce interval for live search input
 
 FILE_CATEGORIES = {
     "All Files & Folders (*.*)": None,
@@ -64,14 +68,18 @@ FILE_CATEGORIES = {
 }
 
 class DataRecoveryApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, initial_rsf=None):
         super().__init__()
         self.title("ChronoRecovery — Advanced Deep Filesystem & File Recovery Suite")
         self.geometry("1180x720")
         self.minsize(950, 580)
 
         # Setup Window & Taskbar Icon
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        if getattr(sys, 'frozen', False):
+            self.base_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
         icon_ico = os.path.join(self.base_dir, "assets", "icons", "app_icon.ico")
         icon_png = os.path.join(self.base_dir, "assets", "icons", "app_icon.png")
 
@@ -103,6 +111,9 @@ class DataRecoveryApp(tk.Tk):
         self.is_scanning = False
         self.is_recovering = False
         self.last_recovered_dir = ""
+        self._search_after_id = None
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Setup Styles
         self.setup_styles()
@@ -112,6 +123,26 @@ class DataRecoveryApp(tk.Tk):
 
         # Load drives on startup
         self.refresh_drives()
+
+        # Automatically load session if opened via command line / file association
+        if initial_rsf:
+            self.after(300, lambda: self.load_rsf_file(initial_rsf, notify=True))
+
+    def on_close(self):
+        """Releases any open volume scanner handles before destroying the window."""
+        if self._search_after_id is not None:
+            try:
+                self.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+            self._search_after_id = None
+        if self.current_scanner is not None:
+            try:
+                self.current_scanner.close()
+            except Exception:
+                pass
+            self.current_scanner = None
+        self.destroy()
 
     def setup_styles(self):
         self.style = ttk.Style(self)
@@ -204,10 +235,10 @@ class DataRecoveryApp(tk.Tk):
         self.chk_intact = ttk.Checkbutton(filter_frame, text="100% Intact only", variable=self.var_intact_only, command=self.apply_filters)
         self.chk_intact.pack(side="left", padx=(0, 20))
 
-        # Live search box
+        # Live search box (debounced for large result sets)
         ttk.Label(filter_frame, text="🔍 Search:").pack(side="left", padx=(0, 4))
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *args: self.apply_filters())
+        self.search_var.trace_add("write", self._on_search_changed)
         self.search_entry = ttk.Entry(filter_frame, textvariable=self.search_var, width=28)
         self.search_entry.pack(side="left")
 
@@ -379,8 +410,18 @@ class DataRecoveryApp(tk.Tk):
         self.lbl_status.config(text=f"Scan complete. Discovered {len(self.all_files)} total items.")
         self.apply_filters()
 
+    def _on_search_changed(self, *args):
+        """Debounces keystroke events on the live search box to keep UI responsive."""
+        if self._search_after_id is not None:
+            try:
+                self.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+        self._search_after_id = self.after(SEARCH_DEBOUNCE_MS, self.apply_filters)
+
     def apply_filters(self):
         """Filters the scanned files based on user category, deleted-only, intact-only, and search query."""
+        self._search_after_id = None
         category = self.category_combo.get()
         allowed_exts = FILE_CATEGORIES.get(category)
         deleted_only = self.var_deleted_only.get()
@@ -421,15 +462,22 @@ class DataRecoveryApp(tk.Tk):
         tot_del = sum(1 for f in filtered if f['status'] == 'DELETED')
         tot_intact = sum(1 for f in filtered if f['integrity'].startswith("100% INTACT"))
 
-        self.lbl_stats_total.config(text=f"Showing: {len(filtered)} / {len(self.all_files)} items")
+        display_slice = filtered[:MAX_DISPLAY_ROWS]
+        if len(filtered) > MAX_DISPLAY_ROWS:
+            self.lbl_stats_total.config(
+                text=f"Showing: {MAX_DISPLAY_ROWS:,} of {len(filtered):,} matched ({len(self.all_files):,} total)"
+            )
+        else:
+            self.lbl_stats_total.config(text=f"Showing: {len(filtered)} / {len(self.all_files)} items")
         self.lbl_stats_deleted.config(text=f"Deleted: {tot_del}")
         self.lbl_stats_intact.config(text=f"100% Intact: {tot_intact}")
 
         # Populate tree
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        children = self.tree.get_children()
+        if children:
+            self.tree.delete(*children)
 
-        for idx, f in enumerate(filtered):
+        for idx, f in enumerate(display_slice):
             tag = "active"
             if f['status'] == 'DELETED':
                 tag = "deleted_intact" if f['integrity'].startswith("100% INTACT") else "deleted_corrupt"
@@ -518,12 +566,13 @@ class DataRecoveryApp(tk.Tk):
             if not proceed:
                 return
 
-        dest_dir = filedialog.askdirectory(title="Choose Destination Folder (Save to C: or D:, NEVER to G:)")
+        selected_drive = self.get_selected_drive()
+        src_letter = f"{selected_drive['letter']}:" if selected_drive else "source drive"
+        dest_dir = filedialog.askdirectory(title=f"Choose Destination Folder (NEVER save to {src_letter})")
         if not dest_dir:
             return
 
         # Check safety: Destination must not be the drive being scanned!
-        selected_drive = self.get_selected_drive()
         if selected_drive and dest_dir.upper().startswith(selected_drive['letter'].upper() + ":"):
             messagebox.showerror(
                 "Unsafe Destination",
@@ -545,11 +594,25 @@ class DataRecoveryApp(tk.Tk):
         total_count = len(items)
         success_count = 0
         failed_count = 0
+        used_paths = set()
 
         for i, item in enumerate(items):
-            # Target path
-            rel_name = os.path.basename(item['name'])
-            target_path = os.path.join(dest_dir, item['status'].lower(), rel_name)
+            # Target path with automatic deduplication for colliding basenames
+            rel_name = os.path.basename(item['name']) or f"recovered_{i+1}.bin"
+            status_subdir = os.path.join(dest_dir, item['status'].lower())
+            target_path = os.path.join(status_subdir, rel_name)
+            norm_target = os.path.normcase(target_path)
+            if norm_target in used_paths or os.path.exists(target_path):
+                stem, ext = os.path.splitext(rel_name)
+                counter = 2
+                while True:
+                    candidate = os.path.join(status_subdir, f"{stem} ({counter}){ext}")
+                    if os.path.normcase(candidate) not in used_paths and not os.path.exists(candidate):
+                        target_path = candidate
+                        norm_target = os.path.normcase(candidate)
+                        break
+                    counter += 1
+            used_paths.add(norm_target)
 
             self.after(0, lambda name=rel_name, num=i+1: self.lbl_status.config(
                 text=f"Recovering [{num}/{total_count}] {name}..."
@@ -561,7 +624,7 @@ class DataRecoveryApp(tk.Tk):
             else:
                 failed_count += 1
 
-            progress_pct = int(((i + 1) / total_count) * 100)
+            progress_pct = int(((i + 1) / total_count) * 100) if total_count > 0 else 100
             self.after(0, lambda val=progress_pct: self.progress_bar.config(value=val))
 
         self.after(0, lambda: self._recovery_completed(success_count, failed_count, dest_dir))
@@ -578,7 +641,10 @@ class DataRecoveryApp(tk.Tk):
 
     def open_recovery_folder(self):
         target = self.last_recovered_dir if (self.last_recovered_dir and os.path.exists(self.last_recovered_dir)) else os.path.abspath(".")
-        subprocess.Popen(f'explorer "{target}"')
+        if hasattr(os, "startfile"):
+            os.startfile(target)
+        else:
+            subprocess.Popen(["explorer", target])
 
     def save_rsf_session(self):
         """Exports current scan state to a binary .rsf session file."""
@@ -624,15 +690,8 @@ class DataRecoveryApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save session: {e}")
 
-    def load_rsf_session(self):
-        """Loads and restores an existing .rsf session file."""
-        rsf_path = filedialog.askopenfilename(
-            title="Load Scan Session (.rsf)",
-            filetypes=[("Recovery Scan File", "*.rsf"), ("All Files", "*.*")]
-        )
-        if not rsf_path:
-            return
-
+    def load_rsf_file(self, rsf_path, notify=False):
+        """Loads and restores an existing .rsf session file given a file path."""
         try:
             session = RecoverySession.load_rsf(rsf_path)
             self.all_files = []
@@ -657,12 +716,28 @@ class DataRecoveryApp(tk.Tk):
 
             self.lbl_status.config(text=f"Loaded session '{os.path.basename(rsf_path)}' ({len(self.all_files)} items, CRC: 0x{session.header.checksum:04X})")
             self.apply_filters()
-            messagebox.showinfo("Session Restored", f"Successfully restored session with {len(self.all_files)} entries.")
+            if notify:
+                messagebox.showinfo("Session Restored", f"Successfully restored session with {len(self.all_files)} entries from:\n{rsf_path}")
+            return True
         except Exception as e:
             messagebox.showerror("Load Error", f"Failed to restore session: {e}")
+            return False
+
+    def load_rsf_session(self):
+        """Loads and restores an existing .rsf session file via file dialog."""
+        rsf_path = filedialog.askopenfilename(
+            title="Load Scan Session (.rsf)",
+            filetypes=[("Recovery Scan File", "*.rsf"), ("All Files", "*.*")]
+        )
+        if not rsf_path:
+            return
+        self.load_rsf_file(rsf_path, notify=True)
 
 def main():
-    app = DataRecoveryApp()
+    initial_rsf = None
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith('.rsf') and os.path.exists(sys.argv[1]):
+        initial_rsf = sys.argv[1]
+    app = DataRecoveryApp(initial_rsf=initial_rsf)
     app.mainloop()
 
 if __name__ == '__main__':

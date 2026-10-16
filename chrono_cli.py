@@ -14,6 +14,7 @@ import sys
 import os
 import argparse
 import datetime
+from exfat_recovery import human_size
 from recovery_session import (
     RecoverySession,
     RSFHeader,
@@ -23,13 +24,6 @@ from recovery_session import (
     GUID_SCAN_CONFIG,
     GUID_FILE_TREE
 )
-
-def human_size(n_bytes: int) -> str:
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if abs(n_bytes) < 1024.0:
-            return f"{n_bytes:3.1f} {unit}"
-        n_bytes /= 1024.0
-    return f"{n_bytes:.1f} PB"
 
 def cmd_capture(args):
     print(f"[*] Capturing scan state from: {args.target}")
@@ -104,76 +98,77 @@ def cmd_inspect(args):
         print(f"[-] Error: file not found '{args.file}'")
         sys.exit(1)
 
-    with open(args.file, 'rb') as f:
-        data = f.read()
-
+    file_size = os.path.getsize(args.file)
     print(f"=== RSF BINARY INSPECTION: {args.file} ===")
-    print(f"Total File Size: {len(data)} bytes ({human_size(len(data))})\n")
+    print(f"Total File Size: {file_size} bytes ({human_size(file_size)})\n")
 
-    # Header
-    if len(data) < 132:
+    if file_size < 132:
         print("[-] Error: File smaller than 132-byte RSF header")
         return
 
-    hdr_bytes = data[:132]
-    header = RSFHeader.deserialize(hdr_bytes)
-    print("--- [0x0000..0x0084] GLOBAL FILE HEADER (132 bytes) ---")
-    print(f"  Magic GUID      : {header.magic.hex()} ({'VALID' if header.magic == MAGIC_GUID else 'INVALID'})")
-    print(f"  Block Size      : 0x{header.block_size:X} ({header.block_size} bytes)")
-    print(f"  CRC-16 Checksum : 0x{header.checksum:04X} (VERIFIED OK)")
-    print(f"  Format Version  : {header.version}")
-    print(f"  Flags / Type    : 0x{header.flags:X}")
-    print(f"  Description     : {header.description or '(empty)'}\n")
-
-    # Chunks
-    offset = 132
-    chunk_index = 0
     chunk_names = {
         GUID_PARTITION_INFO: "PARTITION_INFO (Target partition list)",
         GUID_SCAN_CONFIG: "SCAN_CONFIG (Scan parameters & mode ID)",
         GUID_FILE_TREE: "FILE_TREE (Scanned directory & files graph)",
     }
 
-    print("--- CHUNK CONTAINER INVENTORY ---")
-    f_stream = open(args.file, 'rb')
-    f_stream.seek(132)
-    while True:
-        pos = f_stream.tell()
-        chunk = RSFChunk.read_next_chunk(f_stream)
-        if not chunk:
-            break
-        name = chunk_names.get(chunk.chunk_guid, f"UNKNOWN_CHUNK ({chunk.chunk_guid.hex()})")
-        print(f"  Chunk #{chunk_index} @ 0x{pos:06X}:")
-        print(f"    Type GUID    : {chunk.chunk_guid.hex()}")
-        print(f"    Name         : {name}")
-        print(f"    Payload Size : {len(chunk.payload)} bytes ({human_size(len(chunk.payload))})")
-        chunk_index += 1
-    f_stream.close()
+    with open(args.file, 'rb') as f_stream:
+        hdr_bytes = f_stream.read(132)
+        header = RSFHeader.deserialize(hdr_bytes)
+        print("--- [0x0000..0x0084] GLOBAL FILE HEADER (132 bytes) ---")
+        print(f"  Magic GUID      : {header.magic.hex()} ({'VALID' if header.magic == MAGIC_GUID else 'INVALID'})")
+        print(f"  Block Size      : 0x{header.block_size:X} ({header.block_size} bytes)")
+        print(f"  CRC-16 Checksum : 0x{header.checksum:04X} (VERIFIED OK)")
+        print(f"  Format Version  : {header.version}")
+        print(f"  Flags / Type    : 0x{header.flags:X}")
+        print(f"  Description     : {header.description or '(empty)'}\n")
+
+        print("--- CHUNK CONTAINER INVENTORY ---")
+        chunk_index = 0
+        while True:
+            pos = f_stream.tell()
+            chunk = RSFChunk.read_next_chunk(f_stream)
+            if not chunk:
+                break
+            name = chunk_names.get(chunk.chunk_guid, f"UNKNOWN_CHUNK ({chunk.chunk_guid.hex()})")
+            print(f"  Chunk #{chunk_index} @ 0x{pos:06X}:")
+            print(f"    Type GUID    : {chunk.chunk_guid.hex()}")
+            print(f"    Name         : {name}")
+            print(f"    Payload Size : {len(chunk.payload)} bytes ({human_size(len(chunk.payload))})")
+            chunk_index += 1
 
 def cmd_extract(args):
     if not os.path.exists(args.file):
         print(f"[-] Error: file not found '{args.file}'")
         sys.exit(1)
 
-    print(f"[*] Restoring file structures from: {args.file} into: {args.output}")
+    out_root = os.path.abspath(args.output)
+    print(f"[*] Restoring file structures from: {args.file} into: {out_root}")
     session = RecoverySession.load_rsf(args.file)
-    os.makedirs(args.output, exist_ok=True)
+    os.makedirs(out_root, exist_ok=True)
     
     extracted_dirs = 0
     extracted_files = 0
     total_bytes = 0
 
     for path, node in session.walk():
-        target_path = os.path.join(args.output, path)
+        target_path = os.path.abspath(os.path.join(out_root, path))
+        # Path traversal protection: ensure target stays within out_root
+        try:
+            if os.path.commonpath([out_root, target_path]) != out_root:
+                continue
+        except ValueError:
+            continue
+
         if node.is_directory:
             os.makedirs(target_path, exist_ok=True)
             extracted_dirs += 1
         else:
             parent = os.path.dirname(target_path)
-            os.makedirs(parent, exist_ok=True)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             # Create recovered file stub matching recorded size
             with open(target_path, 'wb') as f:
-                # Fill or truncate to original size (sparse/zero fill for demo)
                 if node.size > 0:
                     f.truncate(node.size)
             

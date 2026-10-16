@@ -49,42 +49,55 @@ class RecoverySession:
         node_counter = 1
         current_sector = 2048  # Simulating standard 1MB partition alignment
 
-        def scan_dir(dir_path: str) -> FileNode:
+        def scan_dir(dir_path: str, depth: int = 0) -> FileNode:
             nonlocal node_counter, current_sector
-            stat = os.stat(dir_path)
+            try:
+                stat = os.stat(dir_path, follow_symlinks=False)
+                ctime = int(stat.st_ctime)
+                mtime = int(stat.st_mtime)
+            except OSError:
+                ctime = 0
+                mtime = 0
+
             node = FileNode(
                 node_id=node_counter,
                 name=os.path.basename(dir_path) or dir_path,
                 is_directory=True,
                 size=0,
                 start_sector=current_sector,
-                creation_time=int(stat.st_ctime),
-                modified_time=int(stat.st_mtime),
+                creation_time=ctime,
+                modified_time=mtime,
                 attributes=0x10,
                 fs_type=0
             )
             node_counter += 1
             current_sector += 8  # 8 sectors per directory index record
 
+            if depth >= 128:
+                return node
+
             try:
-                entries = sorted(os.listdir(dir_path))
-            except PermissionError:
+                with os.scandir(dir_path) as it:
+                    entries = sorted(it, key=lambda e: e.name)
+            except OSError:
                 return node
 
             dir_size = 0
             for entry in entries:
-                full_item = os.path.join(dir_path, entry)
                 try:
-                    item_stat = os.stat(full_item)
-                    if os.path.isdir(full_item):
-                        child = scan_dir(full_item)
+                    # Do not follow symlinks or Windows junctions to prevent infinite loops
+                    if entry.is_symlink():
+                        continue
+                    item_stat = entry.stat(follow_symlinks=False)
+                    if entry.is_dir(follow_symlinks=False):
+                        child = scan_dir(entry.path, depth + 1)
                         node.add_child(child)
                         dir_size += child.size
                     else:
                         f_size = item_stat.st_size
                         f_node = FileNode(
                             node_id=node_counter,
-                            name=entry,
+                            name=entry.name,
                             is_directory=False,
                             size=f_size,
                             start_sector=current_sector,
@@ -94,12 +107,11 @@ class RecoverySession:
                             fs_type=0
                         )
                         node_counter += 1
-                        # Sectors needed for this file
                         sectors = max(1, (f_size + sector_size - 1) // sector_size)
                         current_sector += sectors
                         node.add_child(f_node)
                         dir_size += f_size
-                except (PermissionError, FileNotFoundError):
+                except OSError:
                     continue
 
             node.size = dir_size
@@ -114,8 +126,12 @@ class RecoverySession:
         )
         return cls(header=hdr, partition_info=part_info, scan_config=scan_cfg, root_nodes=[root_node])
 
-    def save_rsf(self, output_path: str):
+    def save_rsf(self, output_path: str) -> None:
         """Serializes session to a binary .rsf file."""
+        parent_dir = os.path.dirname(os.path.abspath(output_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
         with open(output_path, 'wb') as f:
             # 1. Write Header (132 bytes)
             f.write(self.header.serialize())
@@ -132,28 +148,23 @@ class RecoverySession:
 
             # 4. Write File Tree Chunk
             tree_buf = bytearray()
-            # is_filter_scan (uint8 = 0)
-            tree_buf += struct.pack('<B', 0)
-            
-            # Counts
+            tree_buf += struct.pack('<B', 0)  # is_filter_scan (uint8 = 0)
+
             total_dirs = 0
             total_files = 0
-            def count_items(n: FileNode):
-                nonlocal total_dirs, total_files
+            stack = list(self.root_nodes)
+            while stack:
+                n = stack.pop()
                 if n.is_directory:
                     total_dirs += 1
                 else:
                     total_files += 1
-                for c in n.children:
-                    count_items(c)
-
-            for rn in self.root_nodes:
-                count_items(rn)
+                stack.extend(n.children)
 
             # directory count, reserved, raw/deep count, root items count
             tree_buf += struct.pack('<IIII', total_dirs, 0, total_files, len(self.root_nodes))
             for rn in self.root_nodes:
-                tree_buf += rn.serialize()
+                rn.serialize_to_buffer(tree_buf)
 
             tree_chunk = RSFChunk(GUID_FILE_TREE, bytes(tree_buf))
             f.write(tree_chunk.serialize())

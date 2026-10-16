@@ -29,8 +29,16 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ============================================================
-echo   [OK] ChronoRecovery successfully installed!
-echo   Launch the application by double-clicking 'run_gui.bat'
+echo   [OK] ChronoRecovery dependencies successfully installed!
 echo ============================================================
 echo.
+set /p run_inst="Would you like to run the Windows Desktop Installer now? [Y/n]: "
+if /i "%run_inst%"=="n" (
+    echo.
+    echo To launch the application, run 'run_gui.bat' or 'python recovery_gui.py'.
+    pause
+    exit /b 0
+)
+
+call "%~dp0installer.bat" install
 pause

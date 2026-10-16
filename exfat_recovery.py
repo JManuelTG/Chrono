@@ -7,14 +7,32 @@ and extracts clusters directly from unallocated space.
 import os
 import struct
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Set, Tuple
+
+FAT_CACHE_BLOCK_SIZE = 65536  # 64 KB FAT window cache (16,384 cluster entries per read)
+MAX_DIRECTORY_DEPTH = 64      # Guard against corrupted circular directory trees
+RECOVERY_CHUNK_SIZE = 1024 * 1024  # 1 MB streaming I/O buffer
+
 
 class AlignedVolumeReader:
+    """Sector-aligned raw volume and disk image reader."""
+
     def __init__(self, volume_path: str, sector_size: int = 512):
+        if sector_size <= 0 or (sector_size & (sector_size - 1)) != 0:
+            raise ValueError(f"sector_size must be a positive power of 2, got {sector_size}")
+        self.volume_path = volume_path
         self.f = open(volume_path, 'rb')
         self.sector_size = sector_size
 
+    def __enter__(self) -> 'AlignedVolumeReader':
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     def read_exact(self, offset: int, size: int) -> bytes:
+        if size <= 0 or offset < 0:
+            return b''
         aligned_start = (offset // self.sector_size) * self.sector_size
         offset_in_sector = offset - aligned_start
         total_to_read = ((offset_in_sector + size + self.sector_size - 1) // self.sector_size) * self.sector_size
@@ -22,8 +40,13 @@ class AlignedVolumeReader:
         data = self.f.read(total_to_read)
         return data[offset_in_sector : offset_in_sector + size]
 
-    def close(self):
-        self.f.close()
+    def close(self) -> None:
+        if getattr(self, 'f', None) is not None:
+            try:
+                self.f.close()
+            except OSError:
+                pass
+            self.f = None
 
 def parse_exfat_timestamp(ts_val: int) -> Optional[datetime]:
     if not ts_val:
@@ -194,17 +217,19 @@ def verify_file_integrity(first_bytes: bytes, filename: str) -> str:
     return "UNKNOWN"
 
 class ExFatScanner:
-    def __init__(self, drive_letter: str):
+    def __init__(self, drive_letter: str = "G", image_path: Optional[str] = None):
         self.drive_letter = drive_letter.upper().strip(":\\")
-        self.vol_path = rf"\\.\{self.drive_letter}:"
+        self.vol_path = image_path or rf"\\.\{self.drive_letter}:"
         self.reader = AlignedVolumeReader(self.vol_path)
+        self._fat_cache: Dict[int, bytes] = {}
 
         bs = self.reader.read_exact(0, 512)
-        if bs[3:11] != b'EXFAT   ':
+        if len(bs) < 512 or bs[3:11] != b'EXFAT   ':
             self.reader.close()
-            raise ValueError(f"Drive {self.drive_letter}: is not an exFAT volume (signature: {bs[3:11]})")
+            raise ValueError(f"Drive {self.drive_letter}: is not an exFAT volume (signature: {bs[3:11]!r})")
 
         self.sector_size = 1 << bs[0x6C]
+        self.reader.sector_size = self.sector_size
         self.cluster_size = self.sector_size * (1 << bs[0x6D])
         self.heap_offset_sectors = struct.unpack('<I', bs[0x58:0x5C])[0]
         self.heap_offset_bytes = self.heap_offset_sectors * self.sector_size
@@ -213,147 +238,212 @@ class ExFatScanner:
         self.fat_offset_sectors = struct.unpack('<I', bs[0x50:0x54])[0]
         self.fat_offset_bytes = self.fat_offset_sectors * self.sector_size
 
+    def __enter__(self) -> 'ExFatScanner':
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     def cluster_to_byte_offset(self, c: int) -> int:
         return self.heap_offset_bytes + (c - 2) * self.cluster_size
 
     def read_fat_entry(self, c: int) -> int:
-        data = self.reader.read_exact(self.fat_offset_bytes + c * 4, 4)
-        return struct.unpack('<I', data)[0]
+        """Reads a 32-bit FAT entry using a 64 KB block cache to minimize disk seeks."""
+        byte_pos = self.fat_offset_bytes + c * 4
+        block_base = (byte_pos // FAT_CACHE_BLOCK_SIZE) * FAT_CACHE_BLOCK_SIZE
+        if block_base not in self._fat_cache:
+            if len(self._fat_cache) >= 128:
+                self._fat_cache.clear()
+            self._fat_cache[block_base] = self.reader.read_exact(block_base, FAT_CACHE_BLOCK_SIZE)
+        block = self._fat_cache[block_base]
+        rel = byte_pos - block_base
+        if rel + 4 > len(block):
+            data = self.reader.read_exact(byte_pos, 4)
+            return struct.unpack('<I', data)[0] if len(data) == 4 else 0
+        return struct.unpack_from('<I', block, rel)[0]
 
     def get_cluster_chain(self, start_cluster: int, no_fat_chain: bool = False, num_clusters: int = 1) -> List[int]:
+        max_len = min(max(1, num_clusters), max(1, self.cluster_count))
         if no_fat_chain:
-            return list(range(start_cluster, start_cluster + num_clusters))
-        chain = []
+            return list(range(start_cluster, start_cluster + max_len))
+        chain: List[int] = []
+        seen: Set[int] = set()
         curr = start_cluster
-        while 2 <= curr <= self.cluster_count + 1:
+        while 2 <= curr <= self.cluster_count + 1 and len(chain) < max_len:
             chain.append(curr)
+            seen.add(curr)
             nxt = self.read_fat_entry(curr)
-            if nxt >= 0xFFFFFFF8 or nxt == 0xFFFFFFF7:
+            if nxt == 0 or nxt >= 0xFFFFFFF7:
                 break
-            if nxt == curr or nxt in chain:
+            if nxt in seen:
                 break
             curr = nxt
         return chain
 
+    @staticmethod
+    def _coalesce_clusters(clusters: List[int]) -> List[Tuple[int, int]]:
+        """Groups consecutive cluster numbers into (start_cluster, count) runs."""
+        if not clusters:
+            return []
+        runs: List[Tuple[int, int]] = []
+        run_start = clusters[0]
+        run_len = 1
+        for c in clusters[1:]:
+            if c == run_start + run_len:
+                run_len += 1
+            else:
+                runs.append((run_start, run_len))
+                run_start = c
+                run_len = 1
+        runs.append((run_start, run_len))
+        return runs
+
     def scan_all_files(self, progress_callback: Optional[Callable[[str, int], None]] = None) -> List[Dict[str, Any]]:
         """Scans all active and deleted entries and checks header integrity."""
-        visited_clusters = set()
-        found_files = []
+        visited_clusters: Set[int] = set()
+        found_files: List[Dict[str, Any]] = []
         total_examined = 0
 
-        def parse_directory(start_cluster: int, path_prefix: str = "", is_contiguous: bool = False, length_bytes: int = 0):
+        def parse_directory(start_cluster: int, path_prefix: str = "", is_contiguous: bool = False,
+                            length_bytes: int = 0, depth: int = 0) -> None:
             nonlocal total_examined
+            if depth > MAX_DIRECTORY_DEPTH or start_cluster < 2:
+                return
+
             num_clusters = max(1, (length_bytes + self.cluster_size - 1) // self.cluster_size) if length_bytes else 1
+            num_clusters = min(num_clusters, 4096)
             chain = self.get_cluster_chain(start_cluster, no_fat_chain=is_contiguous, num_clusters=num_clusters)
-            if not chain and start_cluster >= 2:
+            if not chain:
                 chain = [start_cluster]
 
-            for c in chain:
-                if c in visited_clusters:
+            dir_clusters = [c for c in chain if c not in visited_clusters]
+            if not dir_clusters:
+                return
+            visited_clusters.update(dir_clusters)
+
+            # Assemble directory stream across clusters so straddling entry sets stay intact
+            dir_buf = bytearray()
+            for run_start, run_len in self._coalesce_clusters(dir_clusters):
+                dir_buf += self.reader.read_exact(
+                    self.cluster_to_byte_offset(run_start),
+                    run_len * self.cluster_size
+                )
+
+            i = 0
+            n_bytes = len(dir_buf)
+            while i + 32 <= n_bytes:
+                entry_type = dir_buf[i]
+                if entry_type == 0x00:
+                    i += 32
                     continue
-                visited_clusters.add(c)
-                cluster_bytes = self.reader.read_exact(self.cluster_to_byte_offset(c), self.cluster_size)
 
-                i = 0
-                while i < len(cluster_bytes):
-                    entry = cluster_bytes[i:i+32]
-                    entry_type = entry[0]
-                    if entry_type == 0x00:
-                        i += 32
-                        continue
+                is_deleted = not bool(entry_type & 0x80)
+                base_type = entry_type & 0x7F
 
-                    is_deleted = not bool(entry_type & 0x80)
-                    base_type = entry_type & 0x7F
+                if base_type == 0x05:
+                    secondary_count = dir_buf[i + 1]
+                    attrs = struct.unpack_from('<H', dir_buf, i + 4)[0]
+                    is_dir = bool(attrs & 0x10)
+                    ctime_raw = struct.unpack_from('<I', dir_buf, i + 8)[0]
+                    mtime_raw = struct.unpack_from('<I', dir_buf, i + 12)[0]
 
-                    if base_type == 0x05:
-                        secondary_count = entry[1]
-                        attrs = struct.unpack('<H', entry[4:6])[0]
-                        is_dir = bool(attrs & 0x10)
-                        ctime_raw = struct.unpack('<I', entry[8:12])[0]
-                        mtime_raw = struct.unpack('<I', entry[12:16])[0]
+                    first_cluster = 0
+                    file_size = 0
+                    no_fat_chain = False
+                    if i + 64 <= n_bytes and (dir_buf[i + 32] & 0x7F) == 0x40:
+                        general_flags = dir_buf[i + 33]
+                        no_fat_chain = bool(general_flags & 2)
+                        first_cluster = struct.unpack_from('<I', dir_buf, i + 52)[0]
+                        file_size = struct.unpack_from('<Q', dir_buf, i + 56)[0]
 
-                        stream_entry = cluster_bytes[i+32 : i+64] if i+32 < len(cluster_bytes) else None
-                        first_cluster = 0
-                        file_size = 0
-                        no_fat_chain = False
-                        if stream_entry and (stream_entry[0] & 0x7F) == 0x40:
-                            general_flags = stream_entry[1]
-                            no_fat_chain = bool(general_flags & 2)
-                            first_cluster = struct.unpack('<I', stream_entry[20:24])[0]
-                            file_size = struct.unpack('<Q', stream_entry[24:32])[0]
+                    name_parts: List[str] = []
+                    for s_idx in range(1, secondary_count):
+                        offset_s = i + 32 * (s_idx + 1)
+                        if offset_s + 32 <= n_bytes and (dir_buf[offset_s] & 0x7F) == 0x41:
+                            name_chunk = bytes(dir_buf[offset_s + 2 : offset_s + 32]).decode(
+                                'utf-16le', errors='replace'
+                            ).split('\x00')[0]
+                            name_parts.append(name_chunk)
 
-                        name_parts = []
-                        for s_idx in range(1, secondary_count):
-                            offset_s = i + 32 * (s_idx + 1)
-                            if offset_s + 32 <= len(cluster_bytes):
-                                n_entry = cluster_bytes[offset_s : offset_s + 32]
-                                if (n_entry[0] & 0x7F) == 0x41:
-                                    name_chunk = n_entry[2:32].decode('utf-16le', errors='replace').split('\x00')[0]
-                                    name_parts.append(name_chunk)
+                    filename = "".join(name_parts)
+                    full_path = f"{path_prefix}\\{filename}" if path_prefix else filename
+                    status = "DELETED" if is_deleted else "ACTIVE"
 
-                        filename = "".join(name_parts)
-                        full_path = f"{path_prefix}\\{filename}" if path_prefix else filename
-                        status = "DELETED" if is_deleted else "ACTIVE"
+                    if filename:
+                        total_examined += 1
+                        if progress_callback and total_examined % 50 == 0:
+                            progress_callback(full_path, total_examined)
 
-                        if filename:
-                            total_examined += 1
-                            if progress_callback and total_examined % 50 == 0:
-                                progress_callback(full_path, total_examined)
+                        integrity = "N/A (Directory)" if is_dir else "NO_DATA"
+                        if not is_dir and first_cluster >= 2 and file_size > 0:
+                            offset = self.cluster_to_byte_offset(first_cluster)
+                            hdr_bytes = self.reader.read_exact(offset, 16)
+                            integrity = verify_file_integrity(hdr_bytes, filename)
 
-                            # Check header integrity
-                            integrity = "N/A (Directory)" if is_dir else "NO_DATA"
-                            if not is_dir and first_cluster >= 2 and file_size > 0:
-                                offset = self.cluster_to_byte_offset(first_cluster)
-                                hdr_bytes = self.reader.read_exact(offset, 16)
-                                integrity = verify_file_integrity(hdr_bytes, filename)
+                        found_files.append({
+                            "name": filename,
+                            "path": full_path,
+                            "status": status,
+                            "is_dir": is_dir,
+                            "size": file_size,
+                            "first_cluster": first_cluster,
+                            "start_sector": (self.cluster_to_byte_offset(first_cluster) // self.sector_size) if first_cluster >= 2 else 0,
+                            "no_fat_chain": no_fat_chain,
+                            "created": parse_exfat_timestamp(ctime_raw),
+                            "modified": parse_exfat_timestamp(mtime_raw),
+                            "integrity": integrity
+                        })
 
-                            found_files.append({
-                                "name": filename,
-                                "path": full_path,
-                                "status": status,
-                                "is_dir": is_dir,
-                                "size": file_size,
-                                "first_cluster": first_cluster,
-                                "start_sector": (self.cluster_to_byte_offset(first_cluster) // self.sector_size) if first_cluster >= 2 else 0,
-                                "no_fat_chain": no_fat_chain,
-                                "created": parse_exfat_timestamp(ctime_raw),
-                                "modified": parse_exfat_timestamp(mtime_raw),
-                                "integrity": integrity
-                            })
+                        if is_dir and first_cluster >= 2 and first_cluster not in visited_clusters:
+                            parse_directory(
+                                first_cluster,
+                                full_path,
+                                is_contiguous=no_fat_chain,
+                                length_bytes=file_size,
+                                depth=depth + 1
+                            )
 
-                            if is_dir and first_cluster >= 2 and first_cluster not in visited_clusters:
-                                parse_directory(first_cluster, full_path, is_contiguous=no_fat_chain, length_bytes=file_size)
-
-                        i += 32 * (1 + secondary_count)
-                    else:
-                        i += 32
+                    i += 32 * (1 + secondary_count)
+                else:
+                    i += 32
 
         parse_directory(self.root_cluster, f"{self.drive_letter}:")
         self._resolve_cluster_collisions(found_files)
         return found_files
 
-    def _resolve_cluster_collisions(self, files: List[Dict[str, Any]]):
+    def _resolve_cluster_collisions(self, files: List[Dict[str, Any]]) -> None:
         """
         Detects overlapping cluster ranges and marks overwritten deleted files.
         Active files take precedence over deleted files.
         Between deleted files, the newer file (more recent timestamp) overwrites the older file.
         """
+        max_valid_clusters = max(1, self.cluster_count)
         intervals = []
-        for idx, f in enumerate(files):
+        for f in files:
             if f['is_dir'] or f['size'] <= 0 or f['first_cluster'] < 2:
                 continue
-            c_count = (f['size'] + self.cluster_size - 1) // self.cluster_size
+            c_count = min((f['size'] + self.cluster_size - 1) // self.cluster_size, max_valid_clusters)
             start_c = f['first_cluster']
-            end_c = start_c + c_count - 1
             ts = f.get('created') or f.get('modified') or datetime.min
-            intervals.append({
-                'start': start_c,
-                'end': end_c,
-                'ts': ts,
-                'status': f['status'],
-                'name': f['name'],
-                'file': f
-            })
+
+            spans: List[Tuple[int, int]] = []
+            if not f.get('no_fat_chain', True):
+                chain = self.get_cluster_chain(start_c, no_fat_chain=False, num_clusters=c_count)
+                if len(chain) >= c_count:
+                    spans = self._coalesce_clusters(chain[:c_count])
+
+            if not spans:
+                spans = [(start_c, c_count)]
+
+            for span_start, span_len in spans:
+                intervals.append({
+                    'start': span_start,
+                    'end': span_start + span_len - 1,
+                    'ts': ts,
+                    'status': f['status'],
+                    'name': f['name'],
+                    'file': f
+                })
 
         intervals.sort(key=lambda x: (x['start'], x['end']))
 
@@ -363,8 +453,9 @@ class ExFatScanner:
                 other = intervals[j]
                 if other['start'] > curr['end']:
                     break
+                if curr['file'] is other['file']:
+                    continue
 
-                # Overlap detected between curr and other
                 if curr['status'] == 'DELETED' and other['status'] == 'ACTIVE':
                     victim, culprit = curr, other
                 elif curr['status'] == 'ACTIVE' and other['status'] == 'DELETED':
@@ -380,30 +471,59 @@ class ExFatScanner:
                 victim['file']['integrity'] = f"OVERWRITTEN (by {culprit['name']})"
                 victim['file']['overwritten_by'] = culprit['name']
 
-    def recover_file(self, item: Dict[str, Any], dest_path: str, progress_fn: Optional[Callable[[int, int], None]] = None) -> bool:
-        """Recovers an intact or deleted file from the cluster heap directly."""
-        if item['size'] <= 0 or item['first_cluster'] < 2:
+    def recover_file(self, item: Dict[str, Any], dest_path: str,
+                     progress_fn: Optional[Callable[[int, int], None]] = None) -> bool:
+        """Recovers an intact or deleted file from the cluster heap, following FAT chains when available."""
+        file_size = item.get('size', 0)
+        first_cluster = item.get('first_cluster', 0)
+        if file_size <= 0 or first_cluster < 2:
             return False
 
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        cluster_num = item['first_cluster']
-        remaining = item['size']
-        total_size = remaining
-        offset = self.cluster_to_byte_offset(cluster_num)
+        parent_dir = os.path.dirname(os.path.abspath(dest_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
 
-        with open(dest_path, 'wb') as out_f:
-            while remaining > 0:
-                bytes_to_read = min(remaining, 1024 * 1024)
-                data = self.reader.read_exact(offset, bytes_to_read)
-                if not data:
-                    break
-                out_f.write(data)
-                remaining -= len(data)
-                offset += len(data)
-                if progress_fn:
-                    progress_fn(total_size - remaining, total_size)
+        needed_clusters = (file_size + self.cluster_size - 1) // self.cluster_size
+        no_fat_chain = bool(item.get('no_fat_chain', True))
 
-        # Restore modified timestamp
+        if no_fat_chain:
+            runs = [(first_cluster, needed_clusters)]
+        else:
+            chain = self.get_cluster_chain(first_cluster, no_fat_chain=False, num_clusters=needed_clusters)
+            # If deleted file had its FAT entries zeroed, fall back to contiguous clusters for the remainder
+            if len(chain) < needed_clusters:
+                last_c = chain[-1] if chain else (first_cluster - 1)
+                missing = needed_clusters - len(chain)
+                chain.extend(range(last_c + 1, last_c + 1 + missing))
+            runs = self._coalesce_clusters(chain)
+
+        remaining = file_size
+        total_size = file_size
+
+        try:
+            with open(dest_path, 'wb') as out_f:
+                for run_start, run_clusters in runs:
+                    if remaining <= 0:
+                        break
+                    run_bytes = min(remaining, run_clusters * self.cluster_size)
+                    offset = self.cluster_to_byte_offset(run_start)
+                    run_remaining = run_bytes
+                    while run_remaining > 0:
+                        bytes_to_read = min(run_remaining, RECOVERY_CHUNK_SIZE)
+                        data = self.reader.read_exact(offset, bytes_to_read)
+                        if not data:
+                            return False
+                        out_f.write(data)
+                        read_len = len(data)
+                        run_remaining -= read_len
+                        remaining -= read_len
+                        offset += read_len
+                        if progress_fn:
+                            progress_fn(total_size - remaining, total_size)
+        except OSError:
+            return False
+
+        # Restore modified timestamp if available
         if item.get('modified'):
             try:
                 m_epoch = item['modified'].timestamp()
@@ -411,7 +531,9 @@ class ExFatScanner:
             except Exception:
                 pass
 
-        return True
+        return remaining <= 0
 
-    def close(self):
-        self.reader.close()
+    def close(self) -> None:
+        self._fat_cache.clear()
+        if getattr(self, 'reader', None) is not None:
+            self.reader.close()

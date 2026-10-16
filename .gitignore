@@ -10,3 +10,4 @@ rea/
 *.egg-info/
 build/
 dist/
+*.spec

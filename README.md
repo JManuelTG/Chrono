@@ -60,10 +60,30 @@ make test        # Run unit tests
 
 ---
 
-### Option B: Windows 1-Click (No setup needed)
+### Option A: Windows Suite Installer (Recommended)
 
-- **Install**: Double-click [`install.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/install.bat)
-- **Launch**: Double-click [`run_gui.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/run_gui.bat)
+Double-click [`installer.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/installer.bat) for an interactive setup wizard:
+- Installs the standalone application into your user profile.
+- Creates a **Desktop Shortcut** with administrative rights (required for direct raw sector read access to USB/drives).
+- Creates **Start Menu** shortcuts under `ChronoRecovery`.
+- Configures **Windows File Association**: `.rsf` scan session files automatically display the custom icon and open in ChronoRecovery when double-clicked.
+- Adds `chrono` to your User `PATH` for terminal access.
+- Includes a 1-click uninstaller ([`uninstall.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/uninstall.bat)).
+
+To build standalone executables (`.exe`) directly:
+```powershell
+python build_exe.py      # Produces dist/ChronoRecovery.exe & dist/chrono.exe
+```
+
+For redistributable installer wizards across systems, compile [`installer.iss`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/installer.iss) using [Inno Setup](https://jrsoftware.org/isdl.php).
+
+---
+
+### Option B: Quick Start Scripts (Source execution)
+
+- **Install Dependencies**: Double-click [`install.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/install.bat)
+- **Launch GUI**: Double-click [`run_gui.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/run_gui.bat)
+- **Uninstall**: Double-click [`uninstall.bat`](file:///c:/Users/Manue/OneDrive/Documentos/DEV/AI%20Projects/Data%20Recovery/uninstall.bat)
 
 ---
 

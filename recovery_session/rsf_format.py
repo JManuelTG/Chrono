@@ -35,7 +35,8 @@ GUID_SCAN_CONFIG    = bytes.fromhex("2565c07d8a638c4ab7d16419641247db")
 GUID_FILE_TREE      = bytes.fromhex("6cf208d28c07344e9d71d91f535f7b57")
 
 HEADER_SIZE = 132       # 0x84 bytes
-CHUNK_HEADER_SIZE = 36 # 0x24 bytes
+CHUNK_HEADER_SIZE = 36  # 0x24 bytes
+MAX_CHUNK_PAYLOAD_SIZE = 512 * 1024 * 1024  # 512 MB safety cap per chunk
 
 # Precomputed CRC-16 table with poly 0x8005 (IBM / BUYPASS)
 def _build_crc16_table(poly: int = 0x8005) -> List[int]:
@@ -143,6 +144,8 @@ class RSFChunk:
         
         chunk_guid = hdr_bytes[0x10:0x20]
         payload_len = struct.unpack('<I', hdr_bytes[0x20:0x24])[0]
+        if payload_len > MAX_CHUNK_PAYLOAD_SIZE:
+            raise ValueError(f"Chunk payload length {payload_len} exceeds safety limit ({MAX_CHUNK_PAYLOAD_SIZE})")
         payload = stream.read(payload_len)
         if len(payload) < payload_len:
             raise ValueError(f"Truncated chunk payload: expected {payload_len} bytes, got {len(payload)}")
